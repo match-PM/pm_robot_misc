@@ -13,7 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
-from std_msgs.msg import Bool, Float64
+from pm_skills_interfaces.msg import BoolStamped, Float64Stamped
 from pm_vision_manager.va_py_modules.camera_ros_interfaces import (
     CameraRosInterfaces,
 )
@@ -64,6 +64,28 @@ def calculate_temporal_median(evaluation_values):
         return 0.0
 
     return float(np.median(evaluation_values))
+
+
+def create_alignment_messages(evaluation_value, result_bool, image_header):
+    """Create timestamped float and boolean values from one acquired image."""
+    float_message = Float64Stamped()
+    float_message.header = image_header
+    float_message.data = evaluation_value
+    bool_message = BoolStamped()
+    bool_message.header = image_header
+    bool_message.data = result_bool
+    return float_message, bool_message
+
+
+def get_header_stamp_ns(header):
+    """Return the required non-zero image acquisition stamp."""
+    stamp_ns = (
+        int(header.stamp.sec) * 1_000_000_000
+        + int(header.stamp.nanosec)
+    )
+    if stamp_ns <= 0:
+        raise ValueError('Camera image has no acquisition timestamp.')
+    return stamp_ns
 
 
 def calculate_circle_score(contour, image_shape):
@@ -158,6 +180,65 @@ def calculate_evaluation_value(binary_image):
     return evaluation_value
 
 
+def calculate_white_pixel_distance_penalty(
+    binary_image,
+    image_processing_handler,
+):
+    """
+    Return a 0..1 penalty for white pixels far from the image center.
+
+    Distances are evaluated in coordinates of the initial camera image.  This
+    is important because ``binary_image`` may contain only an ROI.  Squaring
+    the normalized distance gives pixels near the center little influence,
+    while pixels near the outer image boundary contribute a strong penalty.
+    """
+    if binary_image.ndim != 2:
+        raise ValueError(
+            f'Expected a single-channel binary image, got '
+            f'shape {binary_image.shape}'
+        )
+
+    white_y_roi, white_x_roi = np.nonzero(binary_image)
+    if white_x_roi.size == 0:
+        return 0.0
+
+    white_x_image, white_y_image = (
+        image_processing_handler.CS_Conv_ROI_Pix_TO_Img_Pix(
+            white_x_roi,
+            white_y_roi,
+        )
+    )
+    image_width = image_processing_handler.img_width
+    image_height = image_processing_handler.img_height
+    center_x = (image_width - 1) / 2.0
+    center_y = (image_height - 1) / 2.0
+    maximum_squared_distance = center_x ** 2 + center_y ** 2
+    if maximum_squared_distance <= 0:
+        return 0.0
+
+    squared_distances = (
+        (white_x_image - center_x) ** 2
+        + (white_y_image - center_y) ** 2
+    )
+    return float(np.clip(
+        np.mean(squared_distances / maximum_squared_distance),
+        0.0,
+        1.0,
+    ))
+
+
+def apply_white_pixel_distance_penalty(
+    evaluation_value,
+    binary_image,
+    image_processing_handler,
+):
+    penalty = calculate_white_pixel_distance_penalty(
+        binary_image,
+        image_processing_handler,
+    )
+    return evaluation_value * (1.0 - penalty)
+
+
 def add_video_panel_header(image, label, accent_color):
     image_height, image_width = image.shape[:2]
     header_height = max(36, round(image_height * 0.08))
@@ -219,6 +300,26 @@ def format_evaluation_value(value):
     return f'{value:.2f}'
 
 
+def get_viridis_color(fraction):
+    """Return the OpenCV BGR Viridis color for a normalized value."""
+    color_index = round(255 * float(np.clip(fraction, 0.0, 1.0)))
+    color = cv2.applyColorMap(
+        np.array([[color_index]], dtype=np.uint8),
+        cv2.COLORMAP_VIRIDIS,
+    )[0, 0]
+    return tuple(int(channel) for channel in color)
+
+
+def get_recording_evaluation_range(evaluation_values):
+    """Return the fixed 0-to-maximum scale used for finalized recordings."""
+    if not evaluation_values:
+        raise ValueError('No evaluation values are available')
+    return STREAM_EVALUATION_MIN, max(
+        STREAM_EVALUATION_MIN,
+        max(evaluation_values),
+    )
+
+
 def add_evaluation_scale(
     image,
     evaluation_value,
@@ -243,14 +344,9 @@ def add_evaluation_scale(
     track_y = image_height + round(footer_height * 0.42)
     track_height = max(10, round(footer_height * 0.16))
     segment_count = 64
-    low_color = (50, 100, 255)
-    high_color = EVALUATION_PANEL_COLOR
     for segment_index in range(segment_count):
         fraction = segment_index / (segment_count - 1)
-        color = tuple(
-            round(low + (high - low) * fraction)
-            for low, high in zip(low_color, high_color)
-        )
+        color = get_viridis_color(fraction)
         segment_left = round(
             track_left
             + (track_right - track_left) * segment_index / segment_count
@@ -392,19 +488,18 @@ class MinimalPublisher(Node):
         self.float_output_topic = (
             f'{self.get_name()}/{float_output_topic_name}'
         )
-
         self.bool_publisher = self.create_publisher(
-            Bool,
+            BoolStamped,
             self.bool_output_topic,
             10,
         )
         self.float_publisher = self.create_publisher(
-            Float64,
+            Float64Stamped,
             self.float_output_topic,
             10,
         )
-        # Treat both output topics as one recording trigger.  Starting with no
-        # known subscribers makes the first subscription on either topic the
+        # Treat all output topics as one recording trigger. Starting with no
+        # known subscribers makes the first subscription on any topic the
         # transition that opens the window and starts recording.
         self.output_has_subscribers = False
         self.bool_output_has_subscribers = False
@@ -418,6 +513,8 @@ class MinimalPublisher(Node):
         self.latest_camera_image = None
         self.evaluation_image = None
         self.latest_evaluation_value = None
+        self.latest_acquisition_ros_time_ns = None
+        self.latest_image_receive_ros_time_ns = None
         self.evaluation_history = deque(maxlen=TEMPORAL_MEDIAN_WINDOW)
         self.image_lock = Lock()
         self.window_stop_event = Event()
@@ -531,6 +628,8 @@ class MinimalPublisher(Node):
 
     def camera_callback(self, message):
         try:
+            image_receive_time_ns = self.get_clock().now().nanoseconds
+            acquisition_time_ns = get_header_stamp_ns(message.header)
             image = self.bridge.imgmsg_to_cv2(message, desired_encoding='bgr8')
             self.image_processing_handler.set_initial_image(image)
             self.image_processing_handler.init_begin()
@@ -564,6 +663,11 @@ class MinimalPublisher(Node):
             raw_evaluation_value, selected_image = evaluate_best_circle(
                 binary_image
             )
+            raw_evaluation_value = apply_white_pixel_distance_penalty(
+                raw_evaluation_value,
+                binary_image,
+                self.image_processing_handler,
+            )
             if self.use_temporal_median_filter:
                 self.evaluation_history.append(raw_evaluation_value)
                 evaluation_value = calculate_temporal_median(
@@ -578,19 +682,24 @@ class MinimalPublisher(Node):
                 self.evaluation_image = selected_image
                 self.latest_evaluation_value = evaluation_value
                 self.result_bool = result_bool
+                self.latest_acquisition_ros_time_ns = acquisition_time_ns
+                self.latest_image_receive_ros_time_ns = image_receive_time_ns
 
-            area_msg = Float64()
-            area_msg.data = evaluation_value
+            area_msg, result_msg = create_alignment_messages(
+                evaluation_value,
+                result_bool,
+                message.header,
+            )
             self.float_publisher.publish(area_msg)
             self.logger.info(f"Float_publisher: {evaluation_value}")
-            result_msg = Bool()
-            result_msg.data = result_bool
             self.bool_publisher.publish(result_msg)
 
             if self.float_output_has_subscribers:
                 self.logger.info(
                     f'Publishing on {self.float_output_topic}: '
-                    f'{area_msg.data}'
+                    f'{area_msg.data} at '
+                    f'{area_msg.header.stamp.sec}.'
+                    f'{area_msg.header.stamp.nanosec:09d}'
                 )
             if self.bool_output_has_subscribers:
                 self.logger.info(
@@ -646,7 +755,7 @@ class MinimalPublisher(Node):
 
         elif not has_subscribers and self.output_has_subscribers:
             self.logger.info(
-                'No subscribers remain on either output topic; '
+                'No subscribers remain on any output topic; '
                 'closing the camera window.'
             )
             self.stop_window_thread()
@@ -737,6 +846,10 @@ class MinimalPublisher(Node):
                         else self.evaluation_image.copy()
                     )
                     evaluation_value = self.latest_evaluation_value
+                    acquisition_time_ns = self.latest_acquisition_ros_time_ns
+                    image_receive_time_ns = (
+                        self.latest_image_receive_ros_time_ns
+                    )
 
                 image = None
                 if (
@@ -787,6 +900,11 @@ class MinimalPublisher(Node):
                             'ros_time_sec',
                             'ros_time_nanosec',
                             'ros_time_ns',
+                            'image_acquisition_ros_time_sec',
+                            'image_acquisition_ros_time_nanosec',
+                            'image_acquisition_ros_time_ns',
+                            'image_receive_ros_time_ns',
+                            'acquisition_to_image_receive_ms',
                             'computer_time_unix_ns',
                             'computer_time_iso8601',
                             'evaluation_value',
@@ -800,6 +918,10 @@ class MinimalPublisher(Node):
                     ros_time_ns = self.get_clock().now().nanoseconds
                     ros_time_sec, ros_time_nanosec = divmod(
                         ros_time_ns,
+                        1_000_000_000,
+                    )
+                    acquisition_time_sec, acquisition_time_nanosec = divmod(
+                        acquisition_time_ns,
                         1_000_000_000,
                     )
                     computer_time_ns = time_ns()
@@ -821,6 +943,11 @@ class MinimalPublisher(Node):
                         ros_time_sec,
                         ros_time_nanosec,
                         ros_time_ns,
+                        acquisition_time_sec,
+                        acquisition_time_nanosec,
+                        acquisition_time_ns,
+                        image_receive_time_ns,
+                        (image_receive_time_ns - acquisition_time_ns) / 1e6,
                         computer_time_ns,
                         computer_time_iso8601,
                         evaluation_value,
@@ -836,6 +963,17 @@ class MinimalPublisher(Node):
                 f'Could not display the top-camera window: {error}'
             )
         finally:
+            # Close the GUI as soon as streaming stops.  Rendering the final
+            # fixed-scale video can take considerably longer and must not keep
+            # the live window visible after the last subscriber disconnects.
+            if self.window_open:
+                try:
+                    cv2.destroyWindow(WINDOW_NAME)
+                    cv2.waitKey(1)
+                except cv2.error:
+                    pass
+                self.window_open = False
+
             if timestamp_file is not None:
                 timestamp_file.close()
                 self.logger.info(
@@ -860,14 +998,6 @@ class MinimalPublisher(Node):
                         f'{error}. Source video retained at '
                         f'{source_video_path}'
                     )
-
-            if self.window_open:
-                try:
-                    cv2.destroyWindow(WINDOW_NAME)
-                    cv2.waitKey(1)
-                except cv2.error:
-                    pass
-                self.window_open = False
 
     def create_video_path(self):
         recordings_directory = Path(VIDEO_OUTPUT_PATH)
@@ -905,8 +1035,9 @@ class MinimalPublisher(Node):
         if not evaluation_values:
             raise RuntimeError('No recorded frames are available to render')
 
-        evaluation_min = min(evaluation_values)
-        evaluation_max = max(evaluation_values)
+        evaluation_min, evaluation_max = get_recording_evaluation_range(
+            evaluation_values
+        )
         max_frame_index = evaluation_values.index(evaluation_max)
         self.logger.info(
             'Rendering final video with fixed evaluation range '
