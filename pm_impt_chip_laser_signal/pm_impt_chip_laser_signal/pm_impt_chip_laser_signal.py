@@ -41,7 +41,9 @@ CAMERA_TOPIC = 'Camera_Top_View/pylon_ros2_camera_node/image_raw'
 WINDOW_NAME = 'Top camera'
 INITIAL_WINDOW_WIDTH = 1000
 FALLBACK_WINDOW_HEIGHT = 750
-DEFAULT_EXPOSURE_PERCENT = 50.0
+DEFAULT_EXPOSURE_PERCENT = 10.0
+THRESHOLD_VALUE = 120
+EX_OPEN_KERNEL_SIZE = 3 #7
 VIDEO_FPS = 30.0
 VIDEO_CODEC = 'mp4v'
 CIRCLE_SCORE_THRESHOLD = 80.0
@@ -649,14 +651,14 @@ class MinimalPublisher(Node):
             bgr2gray(self.image_processing_handler)
             threshold(
                 image_processing_handler=self.image_processing_handler,
-                thresh=120,
+                thresh=THRESHOLD_VALUE,
                 maxval=255,
                 type='THRESH_BINARY',
             )
 
             morphologyExOpening(
                 image_processing_handler=self.image_processing_handler,
-                kernelsize=7
+                kernelsize=EX_OPEN_KERNEL_SIZE
             )
 
             binary_image = self.image_processing_handler.get_processing_image()
